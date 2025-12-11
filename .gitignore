@@ -6,6 +6,10 @@
 .RData
 .RDataTmp
 
+# Folders
+data/
+archive/
+
 # User-specific files
 .Ruserdata
 
@@ -39,8 +43,6 @@ vignettes/*.pdf
 # R Environment Variables
 .Renviron
 
-# pkgdown site
-docs/
 
 # translation temp files
 po/*~

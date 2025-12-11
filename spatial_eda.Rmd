@@ -1,0 +1,47 @@
+```{r}
+library(tigris)
+library(terra)
+library(sf)
+library(sp)
+library(tidyverse)
+options(tigris_use_cache = TRUE)
+```
+
+```{r}
+for(fip in c(17, 18, 26, 39, 55)) {
+  tracts = tigris::tracts(fip, cb = T, year = 2021)
+  if(fip == 17) {
+    all_tracts = tracts
+  } else {
+    all_tracts = rbind(all_tracts, tracts)
+  }
+}
+
+counties = tigris::counties(state = c(17, 18, 26, 39, 55), cb = T, year = 2021)
+```
+
+
+```{r}
+# tracts_sf = st_as_sf(all_tracts)
+# counties_sf = st_as_sf(counties)
+# counties_sf = st_boundary(st_union(counties_sf))
+# counties_sf = st_transform(counties_sf, "EPSG:3857")
+# 
+# st_write(counties_sf, "./data/gl_counties.shp", append = F)
+
+```
+
+
+```{r}
+library(ggplot2)
+library(ggmap)
+ggplot() +
+  geom_sf(data = counties_sf)
+```
+
+
+
+```{r}
+
+
+```

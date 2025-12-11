@@ -1,0 +1,215 @@
+```{r}
+require(tidyverse)
+require(sf)
+require(sp)
+require(tigris)
+require(terra)
+options(tigris_use_cache = TRUE)
+```
+
+
+## Census Tracts
+
+```{r}
+state_fips = c(17, 18, 26, 39, 55)
+for(fip in state_fips) {
+  tracts = tigris::tracts(fip, cb = T, year = 2021)
+  if(fip == 17) {
+    tracts_sf = tracts
+  } else {
+    tracts_sf = rbind(tracts_sf, tracts)
+  }
+}
+```
+
+
+
+```{r}
+states <- c("MI", "WI", "IL", "OH", "IN")
+
+tracts <- bind_rows(lapply(states, function(s) {
+  tracts(state = s, year = 2020, class = "sf")
+}))
+
+tracts_v <- vect(tracts)
+
+tracts_ll <- project(tracts_v, "EPSG:4326")
+```
+
+
+## ACS Data
+
+```{r}
+dp03 = read_csv("./data/ACSDP5Y2022.DP03_2025-12-10T025218/ACSDP5Y2022.DP03-Data.csv", show_col_types = F, col_select = c("Geography", contains("Estimate")), skip = 1, name_repair = "unique_quiet")
+dp04 = read_csv("./data/ACSDP5Y2022.DP04_2025-12-10T025141/ACSDP5Y2022.DP04-Data.csv", show_col_types = F, col_select = c("Geography", contains("Estimate")), skip = 1, name_repair = "unique_quiet")
+dp05 = read_csv("./data/ACSDP5Y2022.DP05_2025-12-10T025240/ACSDP5Y2022.DP05-Data.csv", show_col_types = F, col_select = c("Geography", contains("Estimate")), skip = 1, name_repair = "unique_quiet")
+```
+
+
+```{r}
+selected_vars <- c(
+  # DP03 - Economic
+  "Estimate!!INCOME AND BENEFITS (IN 2022 INFLATION-ADJUSTED DOLLARS)!!Total households!!Median household income (dollars)",
+  "Estimate!!PERCENTAGE OF FAMILIES AND PEOPLE WHOSE INCOME IN THE PAST 12 MONTHS IS BELOW THE POVERTY LEVEL!!All people",
+  "Estimate!!EMPLOYMENT STATUS!!Civilian labor force!!Unemployment Rate",
+  "Estimate!!INCOME AND BENEFITS (IN 2022 INFLATION-ADJUSTED DOLLARS)!!Total households!!With cash public assistance income",
+  "Estimate!!HEALTH INSURANCE COVERAGE!!Civilian noninstitutionalized population!!No health insurance coverage",
+
+  # DP04 - Housing
+  "Estimate!!YEAR STRUCTURE BUILT!!Total housing units!!Built 1950 to 1959",
+  "Estimate!!YEAR STRUCTURE BUILT!!Total housing units!!Built 1940 to 1949",
+  "Estimate!!YEAR STRUCTURE BUILT!!Total housing units!!Built 1939 or earlier",
+  "Estimate!!YEAR STRUCTURE BUILT!!Total housing units",
+  "Estimate!!UNITS IN STRUCTURE!!Total housing units!!Mobile home",
+  "Estimate!!HOUSING TENURE!!Occupied housing units!!Owner-occupied",
+  "Estimate!!HOUSING TENURE!!Occupied housing units!!Renter-occupied",
+  "Estimate!!HOUSING OCCUPANCY!!Total housing units",
+  "Estimate!!HOUSING OCCUPANCY!!Vacant housing units",
+  "Estimate!!VEHICLES AVAILABLE!!Occupied housing units!!No vehicles available",
+  "Estimate!!VEHICLES AVAILABLE!!Occupied housing units!!1 vehicle available",
+  "Estimate!!VEHICLES AVAILABLE!!Occupied housing units!!2 vehicles available",
+  "Estimate!!VEHICLES AVAILABLE!!Occupied housing units!!3 or more vehicles available",
+  "Estimate!!VEHICLES AVAILABLE!!Occupied housing units",
+  "Estimate!!HOUSE HEATING FUEL!!Occupied housing units!!Electricity",
+
+  # DP05 - Demographics
+  "Estimate!!SEX AND AGE!!Total population!!Under 5 years",
+  "Estimate!!SEX AND AGE!!Total population!!65 years and over...49"
+)
+```
+
+
+```{r}
+acs_fix_names = function(x) {
+  names = colnames(x)
+  names = stringr::str_remove(names, "Estimate!!")
+  names = stringr::str_replace_all(names, "!!", "_")
+  names = tolower(names)
+  colnames(x) <- names
+  return(x)
+}
+
+dp03 = acs_fix_names(dp03 %>% dplyr::select(any_of(selected_vars)))
+dp04 = acs_fix_names(dp04 %>% dplyr::select(any_of(selected_vars)))
+dp05 = acs_fix_names(dp05 %>% dplyr::select(any_of(c(selected_vars))))
+```
+
+
+
+
+## Storm Events
+
+```{r}
+winter_months = c(1:3, 10:12)
+event_keywords = c("winter", "snow", "hail", "ice", "cold", "wind", "flood")
+storm_d.2024 = read_csv("./data/StormEvents_details-ftp_v1.0_d2024_c20251204.csv.gz", show_col_types = F)
+storm_l.2024 = read_csv("./data/StormEvents_locations-ftp_v1.0_d2024_c20251204.csv.gz", show_col_types = F)
+storm_f.2024 = read_csv("./data/StormEvents_fatalities-ftp_v1.0_d2024_c20251204.csv.gz", show_col_types = F)
+storm_full.2024 = left_join(storm_d.2024, storm_f.2024, by = "EVENT_ID")
+storm_full.2024 = left_join(storm_full.2024, storm_l.2024, by = "EVENT_ID", relationship = "many-to-many")
+storm.2024 = storm_full.2024 %>%
+  select(-c(TOR_F_SCALE:END_LOCATION, EPISODE_NARRATIVE:LON2)) %>%
+  filter(STATE_FIPS %in% state_fips) %>%
+  mutate(
+    across(contains("YEARMONTH"), list(
+      YEAR  = ~ .x %/% 100,
+      MONTH = ~ .x %% 100
+    ), .names = "{.col}_{.fn}"), .keep = "unused", .before = EVENT_ID
+  ) %>%
+  filter(BEGIN_YEARMONTH_MONTH %in% winter_months) %>%
+  filter(END_YEARMONTH_MONTH %in% winter_months) %>%
+  mutate(across(is.character, tolower)) %>%
+  filter(str_detect(EVENT_TYPE, str_c(event_keywords, collapse = "|")))
+```
+
+
+
+
+```{r}
+# Folder containing ONLY storm event CSV.gz files
+data_dir <- "./data/storm_data/"
+
+# Identify all files
+all_files <- list.files(data_dir, full.names = TRUE)
+
+# Extract year & type from filenames
+file_info <- tibble(
+  path = all_files,
+  file = basename(all_files)
+) %>%
+  mutate(
+    year = str_extract(file, "d\\d{4}") |> str_remove("^d") |> as.integer(),
+    type = case_when(
+      str_detect(file, "details") ~ "details",
+      str_detect(file, "locations") ~ "locations",
+      str_detect(file, "fatalities") ~ "fatalities",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  drop_na(type)
+
+# Helper: safe CSV loader
+load_csv <- function(path) read_csv(path, show_col_types = FALSE)
+
+# Function to process a single year
+process_year <- function(yr) {
+  
+  # Find files for that year
+  f <- file_info %>% filter(year == yr)
+  
+  # Load datasets
+  d <- load_csv(f$path[f$type == "details"])
+  l <- load_csv(f$path[f$type == "locations"])
+  ftl <- load_csv(f$path[f$type == "fatalities"])
+  
+  # Join them (same logic as your 2024 pipeline)
+  storm <- d %>%
+    left_join(ftl, by = "EVENT_ID") %>%
+    left_join(l, by = "EVENT_ID", relationship = "many-to-many") %>%
+    
+    # Your cleaning pipeline
+    select(-c(TOR_F_SCALE:END_LOCATION, EPISODE_NARRATIVE:LON2)) %>%
+    filter(STATE_FIPS %in% state_fips) %>%
+    mutate(
+      across(contains("YEARMONTH"), list(
+        YEAR  = ~ .x %/% 100,
+        MONTH = ~ .x %% 100
+      ), .names = "{.col}_{.fn}"),
+      .keep = "unused",
+      .before = EVENT_ID
+    ) %>%
+    filter(BEGIN_YEARMONTH_MONTH %in% winter_months) %>%
+    filter(END_YEARMONTH_MONTH %in% winter_months) %>%
+    mutate(across(is.character, tolower)) %>%
+    filter(str_detect(EVENT_TYPE, str_c(event_keywords, collapse = "|")))
+  
+  storm
+}
+
+# Process each year
+all_years <- sort(unique(file_info$year))
+
+storm_all_years <- map_dfr(all_years, process_year)
+```
+
+## Ground Temp
+
+
+
+
+
+## Impervious Ground
+
+```{r}
+imp_ground = rast("data/Annual_NLCD_ImpDsc_2024_CU_C1V1/Annual_NLCD_ImpDsc_2024_CU_C1V1.tif")
+```
+
+
+
+```{r}
+tracts_terra = vect(tracts_sf)
+imp_ground = project(imp_ground, "NAD83")
+imp_crop = crop(imp_ground, tracts_terra)
+plot(tracts_terra)
+
+```
