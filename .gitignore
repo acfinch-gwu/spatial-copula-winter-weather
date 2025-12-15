@@ -8,6 +8,7 @@
 
 # Folders
 data/
+cleaned_data/
 archive/
 
 # User-specific files

@@ -4,6 +4,10 @@ require(sf)
 require(sp)
 require(tigris)
 require(terra)
+library(tidyr)
+library(purrr)
+library(furrr)
+library(future)
 options(tigris_use_cache = TRUE)
 ```
 
@@ -25,34 +29,34 @@ for(fip in state_fips) {
 
 
 ```{r}
-states <- c("MI", "WI", "IL", "OH", "IN")
-
-tracts <- bind_rows(lapply(states, function(s) {
-  tracts(state = s, year = 2020, class = "sf")
-}))
-
-tracts_v <- vect(tracts)
-
-tracts_ll <- project(tracts_v, "EPSG:4326")
+# states <- c("MI", "WI", "IL", "OH", "IN")
+# 
+# tracts <- bind_rows(lapply(states, function(s) {
+#   tracts(state = s, cb = T, year = 2021, class = "sf")
+# }))
+# 
+# tracts_v <- vect(tracts)
+# 
+# tracts_ll <- project(tracts_v, "EPSG:4326")
 ```
 
 
 ## ACS Data
 
 ```{r}
-dp03 = read_csv("./data/ACSDP5Y2022.DP03_2025-12-10T025218/ACSDP5Y2022.DP03-Data.csv", show_col_types = F, col_select = c("Geography", contains("Estimate")), skip = 1, name_repair = "unique_quiet")
-dp04 = read_csv("./data/ACSDP5Y2022.DP04_2025-12-10T025141/ACSDP5Y2022.DP04-Data.csv", show_col_types = F, col_select = c("Geography", contains("Estimate")), skip = 1, name_repair = "unique_quiet")
-dp05 = read_csv("./data/ACSDP5Y2022.DP05_2025-12-10T025240/ACSDP5Y2022.DP05-Data.csv", show_col_types = F, col_select = c("Geography", contains("Estimate")), skip = 1, name_repair = "unique_quiet")
+dp03 = read_csv("./data/DP03/ACSDP5Y2021.DP03-Data.csv", show_col_types = F, col_select = c("Geography", contains("Estimate")), skip = 1, name_repair = "unique_quiet")
+dp04 = read_csv("./data/DP04/ACSDP5Y2021.DP04-Data.csv", show_col_types = F, col_select = c("Geography", contains("Estimate")), skip = 1, name_repair = "unique_quiet")
+dp05 = read_csv("./data/DP05/ACSDP5Y2021.DP05-Data.csv", show_col_types = F, col_select = c("Geography", contains("Estimate")), skip = 1, name_repair = "unique_quiet")
 ```
 
 
 ```{r}
-selected_vars <- c(
+selected_vars_2021 <- c(
+  "Geography",
+
   # DP03 - Economic
-  "Estimate!!INCOME AND BENEFITS (IN 2022 INFLATION-ADJUSTED DOLLARS)!!Total households!!Median household income (dollars)",
-  "Estimate!!PERCENTAGE OF FAMILIES AND PEOPLE WHOSE INCOME IN THE PAST 12 MONTHS IS BELOW THE POVERTY LEVEL!!All people",
-  "Estimate!!EMPLOYMENT STATUS!!Civilian labor force!!Unemployment Rate",
-  "Estimate!!INCOME AND BENEFITS (IN 2022 INFLATION-ADJUSTED DOLLARS)!!Total households!!With cash public assistance income",
+  "Estimate!!INCOME AND BENEFITS (IN 2021 INFLATION-ADJUSTED DOLLARS)!!Total households!!Median household income (dollars)",
+  "Estimate!!INCOME AND BENEFITS (IN 2021 INFLATION-ADJUSTED DOLLARS)!!Total households!!With cash public assistance income",
   "Estimate!!HEALTH INSURANCE COVERAGE!!Civilian noninstitutionalized population!!No health insurance coverage",
 
   # DP04 - Housing
@@ -73,6 +77,7 @@ selected_vars <- c(
   "Estimate!!HOUSE HEATING FUEL!!Occupied housing units!!Electricity",
 
   # DP05 - Demographics
+  "Estimate!!SEX AND AGE!!Total population",
   "Estimate!!SEX AND AGE!!Total population!!Under 5 years",
   "Estimate!!SEX AND AGE!!Total population!!65 years and over...49"
 )
@@ -89,18 +94,110 @@ acs_fix_names = function(x) {
   return(x)
 }
 
-dp03 = acs_fix_names(dp03 %>% dplyr::select(any_of(selected_vars)))
-dp04 = acs_fix_names(dp04 %>% dplyr::select(any_of(selected_vars)))
-dp05 = acs_fix_names(dp05 %>% dplyr::select(any_of(c(selected_vars))))
+dp03.clean = acs_fix_names(dp03 %>% dplyr::select(any_of(selected_vars)))
+dp04.clean = acs_fix_names(dp04 %>% dplyr::select(any_of(selected_vars)))
+dp05.clean = acs_fix_names(dp05 %>% dplyr::select(any_of(c(selected_vars))))
 ```
 
 
+
+```{r}
+acs = left_join(dp03.clean, dp04.clean, by = "geography")
+acs = left_join(acs, dp05.clean, by = "geography")
+acs = acs %>%
+  mutate(GEOID = str_remove(geography, "[:digit:]*US"), .before = geography, .keep = "unused") %>%
+  filter(str_sub(GEOID, 1, 2) %in% as.character(state_fips))
+```
+
+```{r}
+# GEOIDs from ACS
+acs_geoids <- acs$GEOID
+
+# GEOIDs from your tract shapefile
+tract_geoids <- tracts_sf$GEOID  # or whatever your tract dataset is called
+
+# Which ACS GEOIDs are missing from shapefile?
+setdiff(acs_geoids, tract_geoids)
+
+# Which shapefile tracts are missing from ACS?
+setdiff(tract_geoids, acs_geoids)
+
+```
+
+
+
+```{r}
+acs.out = acs %>%
+  dplyr::select(-GEOID) %>%
+  # mutate(across(1, ~ . |>
+  #   na_if("-") |>
+  #   gsub(",", "", x = _) |>
+  #   gsub("\\+$", "", x = _) |>
+  #   gsub("-$", "", x = _) |>
+  #   as.numeric()
+  # )) %>%
+  rename(
+    total_population = `sex and age_total population`,
+    
+    # DP03
+    # median_income = `income and benefits (in 2021 inflation-adjusted dollars)_total households_median household income (dollars)`,
+    # cash_assistance = `income and benefits (in 2021 inflation-adjusted dollars)_total households_with cash public assistance income`,
+    no_insurance = `health insurance coverage_civilian noninstitutionalized population_no health insurance coverage`,
+    
+    # DP04
+    built_1950s = `year structure built_total housing units_built 1950 to 1959`,
+    built_1940s = `year structure built_total housing units_built 1940 to 1949`,
+    built_pre1940 = `year structure built_total housing units_built 1939 or earlier`,
+    total_units_built = `year structure built_total housing units`,
+    mobile_home = `units in structure_total housing units_mobile home`,
+    owner_occ = `housing tenure_occupied housing units_owner-occupied`,
+    renter_occ = `housing tenure_occupied housing units_renter-occupied`,
+    total_units = `housing occupancy_total housing units`,
+    no_vehicle = `vehicles available_occupied housing units_no vehicles available`,
+    one_vehicle = `vehicles available_occupied housing units_1 vehicle available`,
+    two_vehicles = `vehicles available_occupied housing units_2 vehicles available`,
+    threeplus_vehicles = `vehicles available_occupied housing units_3 or more vehicles available`,
+    total_vehicles = `vehicles available_occupied housing units`,
+    electric_heat = `house heating fuel_occupied housing units_electricity`,
+    
+    # DP05
+    under_5 = `sex and age_total population_under 5 years`,
+    over_65 = `sex and age_total population_65 years and over...49`
+  ) %>%
+  mutate(
+    pct_pre1960_housing = (built_1950s + built_1940s + built_pre1940) / total_units_built,
+    pct_renter_occupied = renter_occ / (owner_occ + renter_occ),
+    pct_no_vehicle = no_vehicle / total_vehicles,
+    pct_1_vehicle = one_vehicle / total_vehicles,
+    pct_2_vehicle = two_vehicles / total_vehicles,
+    pct_3plus_vehicle = threeplus_vehicles / total_vehicles,
+    pct_mobile_home = mobile_home / total_units,
+    pct_electric_heat = electric_heat / total_units,
+    vehicles_per_hh = (one_vehicle + 2 * two_vehicles + 3.5 * threeplus_vehicles) / total_vehicles
+  )
+
+
+acs.out = acs.out %>%
+  add_column(GEOID = acs$GEOID)
+
+```
+
+
+```{r}
+write_csv(acs.out, "./cleaned_data/acs_data.csv")
+```
+
+```{r}
+left_join()
+
+```
 
 
 ## Storm Events
 
 ```{r}
 winter_months = c(1:3, 10:12)
+
 event_keywords = c("winter", "snow", "hail", "ice", "cold", "wind", "flood")
 storm_d.2024 = read_csv("./data/StormEvents_details-ftp_v1.0_d2024_c20251204.csv.gz", show_col_types = F)
 storm_l.2024 = read_csv("./data/StormEvents_locations-ftp_v1.0_d2024_c20251204.csv.gz", show_col_types = F)
@@ -192,24 +289,357 @@ all_years <- sort(unique(file_info$year))
 storm_all_years <- map_dfr(all_years, process_year)
 ```
 
-## Ground Temp
+```{r}
+write_csv(storm_all_years, "./cleaned_data/storm_data")
+
+```
 
 
 
+```{r}
+ggplot() + 
+  geom_sf(data = tracts_sf) + 
+  geom_point(data = storm_all_years, aes(x = BEGIN_LON, y = BEGIN_LAT, col = as.factor(EVENT_TYPE)), alpha = 0.3)
+```
+
+
+
+## Winter Weather
+
+```{r}
+# Folder containing ONLY storm event CSV.gz files
+data_dir <- "./data/Daymet_Daily/"
+
+# Identify all files
+all_files <- list.files(data_dir, full.names = TRUE)
+
+# Extract year & type from filenames
+file_info <- tibble(
+  path = all_files,
+  file = basename(all_files)
+) %>%
+  mutate(
+    year = str_extract(file, "\\d{4}") |> as.integer(),
+    type = case_when(
+      str_detect(file, "prcp") ~ "precipitation",
+      str_detect(file, "swe") ~ "snow_water",
+      str_detect(file, "tmin") ~ "temp_min",
+      str_detect(file, "tmax") ~ "temp_max",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  drop_na(type)
+```
+
+
+```{r}
+# time_start = Sys.time()
+# rast_path = "./data/Daymet_Daily/daymet_v4_daily_na_prcp_2019.nc"
+# prcp_2019 = terra::rast(rast_path)
+# daymet_crs = crs(prcp_2019)
+# 
+# tracts_v = vect(tracts_sf)
+# tracts_daymet = project(tracts_v, daymet_crs)
+# 
+# prcp_2019.crop = crop(prcp_2019, tracts_daymet)
+# prcp_2019.mask = mask(prcp_2019.crop, tracts_daymet)
+# 
+# plot(prcp_2019.mask[[1]])
+# 
+# time_end = Sys.time()
+# cat("Total Run Time:", time_end - time_start)
+```
+
+```{r}
+# time_start = Sys.time()
+# 
+# prcp_2019.table = terra::extract(
+#   prcp_2019.mask,
+#   tracts_daymet,
+#   fun = mean,
+#   na.rm = T
+# )
+# time_end = Sys.time()
+# cat("Total Run Time:", time_end - time_start)
+```
+
+
+
+```{r}
+##------------------------------------------------------------
+## 0. Terra memory tuning: OFFLOAD EVERYTHING TO DISK
+##------------------------------------------------------------
+terraOptions(todisk = FALSE)
+terraOptions(memfrac = 0.8)
+
+##------------------------------------------------------------
+## 0. INPUTS
+##------------------------------------------------------------
+if (is.na(sf::st_crs(tracts_sf))) {
+  stop("tracts_sf has no CRS defined – please set CRS before continuing.")
+}
+
+# Pass sf (safe for workers)
+tracts_sf_simple <- tracts_sf
+
+# Terra assigns ID = row index; map these → GEOID
+tract_meta <- tracts_sf_simple |>
+  sf::st_drop_geometry() |>
+  mutate(ID = row_number()) |>
+  select(ID, GEOID)
+
+##------------------------------------------------------------
+## 1. Helper: Build leap-year-aware date vector
+##------------------------------------------------------------
+build_date_sequence <- function(raster_obj, year) {
+
+  # # Try to parse date from layer names first
+  # lyr_names <- names(raster_obj)
+  # 
+  # # DAYMET style: "X2019.01.01"
+  # if (all(grepl("^X\\d{4}\\.\\d{2}\\.\\d{2}$", lyr_names))) {
+  #   dates <- as.Date(sub("^X", "", gsub("\\.", "-", lyr_names)))
+  #   return(dates)
+  # }
+
+  # Fallback: full year with leap year handling
+  start_date <- as.Date(sprintf("%d-01-01", year))
+  end_date   <- as.Date(sprintf("%d-12-31", year))
+  seq(start_date, end_date, by = "day")
+}
+
+##------------------------------------------------------------
+## 2. Function: process one file → wide table stored via disk-backed ops
+##------------------------------------------------------------
+process_daymet_file_wide <- function(path, year, tract_sf, tract_meta) {
+
+  ##------------------------------------------
+  ## Rebuild SpatVector inside worker
+  ##------------------------------------------
+  r0 <- terra::rast(path)
+
+  daymet_crs <- terra::crs(r0)
+  tract_v    <- terra::vect(tract_sf)
+  tracts     <- terra::project(tract_v, daymet_crs)
+
+  ##------------------------------------------
+  ## Disk-backed CROP + MASK
+  ##------------------------------------------
+  r_crop <- terra::crop(
+    r0, tracts)
+
+  r_mask <- terra::mask(
+    r_crop, tracts)
+
+  ##------------------------------------------
+  ## Extract mean over polygons
+  ##------------------------------------------
+  vals <- terra::extract(
+    r_mask,
+    tracts,
+    fun = mean,
+    na.rm = TRUE
+  )
+
+  ##------------------------------------------
+  ## Add GEOID and reorder columns
+  ##------------------------------------------
+  vals <- vals |>
+    left_join(tract_meta, by = "ID") |>
+    select(GEOID, everything(), -ID)
+
+  if (!"GEOID" %in% names(vals)) {
+    stop("GEOID missing after join in file: ", path)
+  }
+
+  ##------------------------------------------
+  ## Build correct date sequence
+  ##------------------------------------------
+  dates <- build_date_sequence(r_mask, year)
+
+  if (length(dates) != (ncol(vals) - 1)) {
+    stop("Date sequence length mismatch in file: ", path)
+  }
+
+  colnames(vals)[-1] <- format(dates, "%Y-%m-%d")
+
+  vals
+}
+
+##------------------------------------------------------------
+## 3. Combine all years for one variable type
+##------------------------------------------------------------
+make_wide_by_type <- function(file_info, type_name, tract_sf, tract_meta) {
+
+  time_start <- Sys.time()
+
+  type_df <- file_info |>
+    filter(type == type_name) |>
+    arrange(year)
+
+  if (nrow(type_df) == 0) {
+    stop("No files found for type = '", type_name, "'.")
+  }
+
+  ## Parallel processing
+  wide_list <- future_map2(
+    type_df$path,
+    type_df$year,
+    ~ process_daymet_file_wide(.x, .y, tract_sf, tract_meta),
+    .progress = TRUE,
+    .options  = furrr_options(seed = TRUE)
+  )
+
+  stopifnot(all(vapply(wide_list, function(x) "GEOID" %in% names(x), logical(1))))
+
+  # Join wide tables across all years
+  out <- reduce(
+    wide_list,
+    ~ left_join(.x, .y, by = "GEOID")
+  )
+
+  cat("\nTotal Run Time for", type_name, ":", Sys.time() - time_start, "\n")
+
+  out
+}
+
+##------------------------------------------------------------
+## 4. Parallel workers
+##------------------------------------------------------------
+plan(multisession, workers = 8)
+
+##------------------------------------------------------------
+## 5. Build wide tables
+##------------------------------------------------------------
+prcp_wide <- make_wide_by_type(file_info, "precipitation", tracts_sf_simple, tract_meta)
+swe_wide  <- make_wide_by_type(file_info, "snow_water",    tracts_sf_simple, tract_meta)
+tmin_wide <- make_wide_by_type(file_info, "temp_min",      tracts_sf_simple, tract_meta)
+tmax_wide <- make_wide_by_type(file_info, "temp_max",      tracts_sf_simple, tract_meta)
+```
+
+```{r}
+write_csv(prcp_wide, "./cleaned_data/prcp_data.csv")
+write_csv(swe_wide, "./cleaned_data/swe_data.csv")
+write_csv(tmax_wide, "./cleaned_data/tmax_data.csv")
+write_csv(tmin_wide, "./cleaned_data/tmin_data.csv")
+```
 
 
 ## Impervious Ground
 
 ```{r}
-imp_ground = rast("data/Annual_NLCD_ImpDsc_2024_CU_C1V1/Annual_NLCD_ImpDsc_2024_CU_C1V1.tif")
+imp = rast("data/Annual_NLCD_FctImp_2024_CU_C1V1/Annual_NLCD_FctImp_2024_CU_C1V1.tif")
+
+tracts_v = vect(tracts_sf)
+tracts_imp = project(tracts_v, crs(imp))
+imp_crop = crop(imp, tracts_imp)
+imp_mask = mask(imp_crop, tracts_imp)
+plot(imp_mask)
+```
+
+```{r}
+imp_fact <- round(90 / res(imp_mask)[1])
+
+time_start = Sys.time()
+imp_mask_coarse = terra::aggregate(imp_mask, fact = imp_fact, fun = "modal", na.rm = T)
+imp_ext <- extract(imp_mask_coarse, tracts_imp, exact = FALSE)
+time_end = Sys.time()
+cat("Total Run Time Imp Extract:", time_end - time_start)
+
+
+imp_prop <- imp_ext %>%
+  mutate(`Pixel Value` = as.numeric(as.character(`Pixel Value`))) %>%
+  group_by(ID) %>%
+  summarise(imp_pct = mean(`Pixel Value`, na.rm = T), .groups = "drop")
+
+imp_prop <- imp_prop %>%
+  left_join(
+    data.frame(ID = 1:nrow(tracts_imp), GEOID = tracts_imp$GEOID),
+    by = "ID"
+  )
+```
+
+
+```{r}
+write_csv(imp_prop, "./cleaned_data/imp_data.csv")
+```
+
+
+```{r}
+imp_geo = left_join(tracts_sf, imp_prop, by = "GEOID")
+imp_geo = st_as_sf(imp_geo)
+ggplot(imp_geo) + 
+  geom_sf(aes(fill = imp_pct), col = NA)
+```
+
+
+```{r}
+lnd = rast("data/Annual_NLCD_LndCov_2024_CU_C1V1/Annual_NLCD_LndCov_2024_CU_C1V1.tif")
+
+time_start = Sys.time()
+tracts_lnd = project(tracts_v, crs(lnd))
+lnd_crop = crop(lnd, tracts_lnd)
+lnd_mask = mask(lnd_crop, tracts_lnd)
+
+lnd_mask = terra::as.int(lnd_mask)
+
+
+lnd_mask <- as.factor(lnd_mask)
+
+levels(lnd_mask) <- data.frame(
+  value = c(11, 12, 21, 22, 23, 24, 31, 41, 42, 43, 52, 71, 81, 82, 90, 95, 250),
+  landcover = c(
+    "Open Water", "Perennial Ice/Snow", "Developed, Open Space", "Developed, Low Intensity",
+    "Developed, Medium Intensity", "Developed, High Intensity", "Barren Land",
+    "Deciduous Forest", "Evergreen Forest", "Mixed Forest", "Shrub/Scrub", "Grassland/Herbaceous",
+    "Pasture/Hay", "Cultivated Crops", "Woody Wetlands", "Emergent Herbaceous Wetlands", "Background")
+)
+
+time_end = Sys.time()
+cat("Time Elapsed Relevel:", time_end - time_start)
+plot(lnd_mask)
+```
+
+
+
+
+```{r}
+lnd_fact <- round(90 / res(lnd_mask)[1])
+lnd_mask_coarse = terra::aggregate(lnd_mask, fact = lnd_fact, fun = "modal", na.rm = T)
+time_start = Sys.time()
+lnd_ext <- extract(lnd_mask_coarse, tracts_lnd, exact = FALSE)
+time_end = Sys.time()
+cat("Time Elapsed lnd extract:", time_end - time_start)
+
+
+lnd_prop <- lnd_ext %>%
+  group_by(ID, landcover) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  tidyr::pivot_wider(
+      names_from = landcover,
+      values_from = count,
+      values_fill = 0
+  )
+
+lnd_prop <- lnd_prop %>%
+  left_join(
+    data.frame(ID = 1:nrow(tracts_lnd), GEOID = tracts_lnd$GEOID),
+    by = "ID"
+  )
 ```
 
 
 
 ```{r}
-tracts_terra = vect(tracts_sf)
-imp_ground = project(imp_ground, "NAD83")
-imp_crop = crop(imp_ground, tracts_terra)
-plot(tracts_terra)
+write_csv(lnd_prop, "./cleaned_data/lnd_data.csv")
+```
+
+
+```{r}
+lnd_geo = left_join(tracts_sf, lnd_prop, by = "GEOID")
+lnd_geo = st_as_sf(lnd_geo)
+ggplot(lnd_geo) + 
+  geom_sf(aes(fill = `Shrub/Scrub`), col = NA)
 
 ```
+

@@ -1,0 +1,24 @@
+```{r}
+require(tidyverse)
+require(tigris)
+require(sf)
+require(pracma)
+require(sp)
+```
+
+
+```{r}
+acs = read_csv("./cleaned_data/acs_data.csv", show_col_types = F)
+```
+
+
+## PCA
+
+```{r}
+acs.vars = acs %>% dplyr::select(-geoid) %>%
+  drop_na() %>%
+  mutate(across(everything(), as.numeric))
+         
+acs_pca = stats::prcomp(acs, center = T)
+
+```

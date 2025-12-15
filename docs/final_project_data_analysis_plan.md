@@ -19,7 +19,7 @@ How winter storm risk and severity effects spatial insurance risk and loss.
 
 ## 4. Data Description
 ### 4.1 Data Source(s)
-- Origin of data (e.g., observational study, experiment, simulation, publicly available dataset).
+- Origin of data (e.g. observational study, experiment, simulation, publicly available dataset).
 - Data collection methods.
 
 ### 4.2 Variables & Measurements
@@ -111,10 +111,10 @@ For each package:
 
 ## 9. Timeline
 - 08-Dec-2025: Background research completed.
-- 08-Dec-2025: Data acquired.
-- 10-Dec-2025: EDA completed.
-- 10-Dec-2025: Initial model results.
+- 10-Dec-2025: Data acquired.
 - 11-Dec-2025: In-class presentation. **(Project proposal/in-progress report)**
+- 13-Dec-2025: EDA completed.
+- 14-Dec-2025: Initial model results.
 - 18-Dec-2025: Project report due.
 
 
@@ -125,3 +125,19 @@ For each package:
 ## 10. References
 - List of academic references supporting methodological choices.
 
+---
+
+## 11. Notes From Presentation
+- Do I need to scale time in the copula model? Most likely not as all the functional covariates are being measured on the same time scale. Curve alignment may be necessary, but unlikely as it would remove the variablility in both space in time.
+- R(s) components are largely static.
+- Comparison, not evaluation, on earlier time window 2013-2018.
+- Potential Hierarchical, Fixed-Effects model to account for the variation that being in different states
+  * Hierarchical model can't be easily validated on a different set of states.
+- Start with basic gaussian copula model with matern covariance and improve from there.
+  * CV hyper-parameters for covariance.
+  * Could evaluate robustness to different copula specifications (Matern vs. Exp vs. Spherical) [covariance mis-specification]
+- Bayesian or Frequentist? Bayesian, much easier for spatial statistics.
+
+
+- How robust are copula models to model mis-specification?
+- Evaluate Isotropy.
