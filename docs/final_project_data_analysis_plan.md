@@ -103,9 +103,16 @@ For each package:
 ---
 
 ## 8. Expected Outcomes & Deliverables
-- Planned tables, figures, and summaries.
-- Expected insights from the model(s).
-- How results will be interpreted in context.
+### 8.1 Plots
+- Sample of swe, prcp, tmin, tmax plots for census tract in each state
+  - 5 curves for each plot (winter 2019 - winter 2023)
+- cloropleth of landcover, impervious land, acs variables (the one with the highest weight)
+- plots of fpca dimensions 1, 2, 3 for sample of winter seasons (probably 3)
+- 
+
+### 8.2 Tables
+- acs table-one without grouping by census tract
+
 
 ---
 

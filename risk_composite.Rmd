@@ -4,21 +4,326 @@ require(tigris)
 require(sf)
 require(pracma)
 require(sp)
+library(ggrastr)
 ```
 
+# Load Data
 
 ```{r}
 acs = read_csv("./cleaned_data/acs_data.csv", show_col_types = F)
+imp = read_csv("./cleaned_data/imp_data.csv", show_col_types = F)
+lnd = read_csv("./cleaned_data/lnd_data.csv", show_col_types = F)
 ```
 
-
-## PCA
 
 ```{r}
-acs.vars = acs %>% dplyr::select(-geoid) %>%
-  drop_na() %>%
-  mutate(across(everything(), as.numeric))
-         
-acs_pca = stats::prcomp(acs, center = T)
+options(tigris_use_cache = TRUE)
+state_fips = c(17, 18, 26, 39, 55)
+for(fip in state_fips) {
+  tracts = tigris::tracts(fip, cb = T, year = 2021)
+  if(fip == 17) {
+    tracts_sf = tracts
+  } else {
+    tracts_sf = rbind(tracts_sf, tracts)
+  }
+}
+tracts_sf = tracts_sf %>% mutate(GEOID = as.numeric(GEOID))
+```
+
+# Transform Data
+
+## ACS
+
+```{r}
+acs_vars = colnames(acs)
+acs_df = acs %>%
+  left_join(tracts_sf, by = "GEOID") %>%
+  mutate(pct_no_insurance = no_insurance / total_population,
+         pct_over_65 = over_65 / total_population) %>%
+  dplyr::select(c(total_units, pct_pre1960_housing, pct_renter_occupied, pct_electric_heat, vehicles_per_hh, pct_no_insurance, pct_over_65, GEOID, ALAND, AWATER)) %>%
+  mutate(unit_density = total_units / ALAND,
+         pct_owner_occupied = 1 - pct_renter_occupied, 
+         .keep = "unused") %>%
+  mutate(across(-GEOID, ~ as.numeric(scale(.x)))) %>%
+  mutate(pct_electric_heat = -pct_electric_heat)
+```
+
+
+## LND
+
+```{r}
+lnd_df = lnd %>%
+  mutate(Developed = `Developed, Open Space` + `Developed, Medium Intensity` + `Developed, High Intensity` + `Developed, Low Intensity`,
+         Forest = `Deciduous Forest` + `Mixed Forest` + `Evergreen Forest`,
+         Wetlands = `Woody Wetlands` + `Emergent Herbaceous Wetlands`, .keep  = "unused") %>%
+  dplyr::select(-c(`NA`, ID, `Open Water`)) %>%
+  mutate(across(-GEOID, ~ as.numeric(scale(.x)))) %>%
+  mutate(Forest = -Forest, 
+         `Grassland_Herbaceous` = -`Grassland/Herbaceous`,
+         `Shrub_Scrub` = -`Shrub/Scrub`,
+         `Pasture_Hay` = `Pasture/Hay`,
+         .keep = "unused")
+```
+
+
+## IMP
+
+```{r}
+imp_df = imp %>%
+  dplyr::select(-ID) %>%
+  mutate(imp_pct = as.numeric(scale(imp_pct)))
+```
+
+
+## Join Data
+
+```{r}
+tracts_geometries = tracts_sf %>% dplyr::select(GEOID, geometry)
+
+df = acs_df %>%
+  left_join(lnd_df, by = "GEOID") %>%
+  left_join(imp_df, by = "GEOID") %>%
+  left_join(tracts_geometries, by = "GEOID")
+colnames(df) = str_replace(tolower(colnames(df)), " ", "_")
+
+write_csv(df, "./cleaned_data/risk_data")
+
+df = st_as_sf(df)
+```
+
+
+# Choropleth Plots
+
+```{r}
+vars = colnames(st_drop_geometry(df %>% dplyr::select(-c(geoid, geometry))))
+verbose_vars = c("Percent Pre-1960s Housing", 
+  "Percent No Electric Heat",
+  "Vehicles Per Household",
+  "Percent No Health Insurance",
+  "Percent Over 65 Years of Age",
+  "Water Area",
+  "Housing Unit Density",
+  "Percent Owner Occupied Housing",
+  "Barren Land",
+  "Cultivated Crops",
+  "Developed Land",
+  "Forest",
+  "Wetlands",
+  "Grassland or Herbaceous",
+  "Shrub or Scrub",
+  "Pasture or Hay",
+  "Impervious Land Percentage")
+names(verbose_vars) = vars
+```
+
+
+```{r}
+library(gtools)
+library(purrr)
+theme_set(theme_bw(base_size = 10))
+
+template <- ggplot() +
+    theme_bw(base_size = 10) +
+    theme(
+      panel.grid = element_blank(),
+      axis.title = element_text(size = 10),
+      axis.text  = element_text(size = 8),
+      legend.text = element_text(size = 8),
+      legend.title = element_text(size = 9),
+      plot.title = element_text(size = 12, hjust = 0.5)
+    )
+
+plots <- map(vars, function(colname) {
+  template + 
+      geom_sf(data = df, aes(fill = .data[[colname]]), col = NA, linewidth = 0) +
+    labs(title = paste0(verbose_vars[[colname]], " - Scaled"), 
+         fill = verbose_vars[[colname]]) +
+    scale_fill_viridis_c()
+})
+
+walk2(vars, plots, function(colname, plot_obj) {
+  ggsave(
+    filename = paste0("./plots/risk_composite/choropleth_", colname, ".png"),
+    plot = plot_obj,
+    width = 6,
+    height = 4,
+    dpi = 300,
+    units = "in",
+    device = "png"
+  )
+})
+```
+
+```{r}
+str(df)
+head(vars)
+head(verbose_vars)
+```
+
+
+# PCA
+
+```{r}
+pca.dat = drop_na(st_drop_geometry(df %>% dplyr::select(-c(geoid, geometry))))
+```
+
+
+```{r, warning = F}
+library(factoextra)
+pca = stats::prcomp(pca.dat, scale = T)
+
+scree = fviz_eig(pca) +
+      theme_bw(base_size = 10) +
+      theme(
+        panel.grid  = element_blank(),
+        axis.title  = element_text(size = 10),
+        axis.text   = element_text(size = 8),
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 9),
+        plot.title  = element_text(size = 12, hjust = 0.5)
+      )
+
+ggsave(
+  filename = "plots/risk_composite/screeplot.png",
+  plot     = scree,
+  width    = 6,
+  height   = 4,
+  dpi      = 300
+)
+
+fviz_pca_var(pca) +
+      theme_bw(base_size = 10) +
+      theme(
+        panel.grid  = element_blank(),
+        axis.title  = element_text(size = 10),
+        axis.text   = element_text(size = 8),
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 9),
+        plot.title  = element_text(size = 12, hjust = 0.5)
+      )
+```
+
+
+```{r}
+library(broom)
+pca_summary = summary(pca)
+pca_summary = as.matrix(pca_summary$importance)
+
+pca_summary.print <- print(pca_summary,
+                    format = "latex",
+                    printToggle = FALSE,
+                    noSpaces = TRUE)
+
+latex_code = kable(pca_summary.print, format = "latex", booktabs = TRUE,
+                   caption = "PCA Summary - Explained Variance")
+
+writeLines(latex_code, "./tables/pca_summary.tex")
+```
+
+
+## Extract Weights
+
+```{r}
+
+k <- 6
+loadings <- pca$rotation[, 1:k]
+eigenvalues <- pca$sdev[1:k]^2
+weights_var <- rowSums(loadings^2 * eigenvalues)
+weights_var <- weights_var / sum(weights_var)
+
+index <- as.matrix(pca.dat) %*% weights_var
+```
+
+
+```{r}
+index_df = tibble(
+  GEOID = drop_na(df)$geoid,
+  risk_index = as.numeric(index),
+  geometry = drop_na(df)$geometry
+  )
+index_sf = st_as_sf(index_df)
+```
+
+
+```{r}
+risk_pca.plot = ggplot() + 
+  ggrastr::rasterize(
+    geom_sf(data = index_sf, aes(fill = risk_index), col = NA, linewidth = 0),
+    dpi = 300) + 
+  labs(title = "Choropleth of Composite Risk Index",
+       subtitle = "PCA Weighting",
+       fill = "Risk Index") +
+  scale_fill_viridis_c() +
+  theme_bw(base_size = 10) + 
+  theme(
+    panel.grid  = element_blank(),
+    axis.title  = element_text(size = 10),
+    axis.text   = element_text(size = 8),
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 9),
+    plot.title  = element_text(size = 12, hjust = 0.5)
+  )
+ggsave(
+  filename = "plots/risk_pca.png",
+  plot     = risk_pca.plot,
+  width    = 6,
+  height   = 4,
+  dpi      = 300
+)
+  
+```
+
+
+# Manual Weighting
+
+```{r}
+
+weights.manual = c(17, 10, 15, 17,  9, 8, 12, 11, 6, 5, 14, 3, 3, 3, 3, 5, 14)
+names(weights.manual) <- vars
+weights.manual <- weights.manual / sum(weights.manual)
+
+index.manual <- as.matrix(pca.dat) %*% weights.manual
+```
+
+
+```{r}
+index_df$risk_index_manual = as.numeric(index.manual)
+index_sf$risk_index_manual = as.numeric(index.manual)
+
+risk_manual.plot = ggplot() + 
+  ggrastr::rasterize(
+    geom_sf(data = index_sf, aes(fill = risk_index_manual), col = NA, linewidth = 0), 
+    dpi = 300) + 
+  labs(title = "Choropleth of Composite Risk Index",
+       subtitle = "Manual Weighting",
+       fill = "Risk Index") +
+  scale_fill_viridis_c() +
+  theme_bw(base_size = 10) + 
+  theme(
+    panel.grid  = element_blank(),
+    axis.title  = element_text(size = 10),
+    axis.text   = element_text(size = 8),
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 9),
+    plot.title  = element_text(size = 12, hjust = 0.5)
+  )
+ggsave(
+  filename = "plots/risk_manual.png",
+  plot     = risk_manual.plot,
+  width    = 6,
+  height   = 4,
+  dpi      = 300
+)
 
 ```
+
+
+# Save Risk DF
+
+```{r}
+write_csv(
+ index_df %>% dplyr::select(-geometry),
+ "./cleaned_data/index_data.csv"
+)
+```
+

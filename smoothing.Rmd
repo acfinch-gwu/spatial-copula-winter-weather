@@ -1,0 +1,1053 @@
+```{r}
+require(tidyverse)
+library(fda)
+library(fdasrvf)
+library(mgcv)
+library(refund)
+library(stringr)
+library(kableExtra)
+library(mgcv)
+library(pROC)
+require(tigris)
+require(sp)
+require(sf)
+require(spdep)
+require(INLA)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+```
+
+# Load Data
+
+```{r}
+data_path = "./cleaned_data/"
+data_files = list.files(data_path, full.names = T)
+data_names = str_replace(str_extract(basename(data_files), "^[:alpha:]*_"), "_", "")
+data_list = lapply(data_files, read_csv, show_col_types = F)
+names(data_list) <- data_names
+```
+
+```{r}
+options(tigris_use_cache = TRUE)
+state_fips = c(17, 18, 26, 39, 55)
+for(fip in state_fips) {
+  tracts = tigris::tracts(fip, cb = T, year = 2021)
+  if(fip == 17) {
+    tracts_sf = tracts
+  } else {
+    tracts_sf = rbind(tracts_sf, tracts)
+  }
+}
+tracts_sf = tracts_sf %>% mutate(GEOID = as.numeric(GEOID))
+```
+
+
+# Winter Season Extraction
+
+```{r}
+winter_data_list_fn = function(df) {
+  
+  # Get all column names except "GEOID"
+  all_dates <- colnames(df)[-1]
+  
+  # Convert to Date format
+  date_cols <- as.Date(all_dates, format = "%Y-%m-%d")
+  
+  # Create a named list to store winter datasets
+  winter_data_list <- list()
+  
+  # Define the range of starting years for winters
+  # E.g., winter 2019 = Oct 2019 to Mar 2020
+  start_years <- 2019:2023  # last winter would be 2023-2024
+  
+  for (year in start_years) {
+    # Define start and end of winter
+    start_date <- as.Date(paste0(year, "-10-01"))
+    end_date <- as.Date(paste0(year + 1, "-03-31"))
+    
+    # Get logical vector of columns in the range
+    in_range <- date_cols >= start_date & date_cols <= end_date
+    
+    # Subset original data frame (including GEOID column)
+    cols_to_keep <- c("GEOID", all_dates[in_range])
+    winter_subset <- df[, cols_to_keep, drop = FALSE]
+    
+    # Store in list with name "Winter2019" etc.
+    winter_data_list[[paste0("winter", year)]] <- winter_subset
+  }
+  return(winter_data_list)
+}
+```
+
+
+```{r}
+predictor_datasets = c("prcp", "swe", "tmax", "tmin")
+
+data_list_winter = list()
+
+for(dataset in predictor_datasets) {
+  data_list_winter[[paste0(dataset)]] <- winter_data_list_fn(data_list[[dataset]])
+}
+```
+
+
+# Fourier Smoothing
+
+```{r}
+# Lookups
+## Variable name lookup
+var_name_map <- c(
+  prcp = "Precipitation",
+  swe  = "Snow-Water Equivalent",
+  tmax = "Maximum Temperature",
+  tmin = "Minimum Temperature"
+)
+
+## State FIPS → abbreviation
+state_fips_map <- c(
+  "17" = "IL",
+  "18" = "IN",
+  "26" = "MI",
+  "39" = "OH",
+  "55" = "WI"
+)
+
+# Directory helper
+ensure_dir <- function(path) {
+  if (!dir.exists(path)) {
+    dir.create(path, recursive = TRUE)
+  }
+}
+
+
+# Main Function
+smooth_fourier_df <- function(
+  df,
+  num_basis = 101,
+  lambda_grid = 10^seq(-6, 6, length = 20),
+  plot_samples = TRUE,
+  title = NULL
+) {
+
+  ## Time index
+  t <- 1:ncol(df %>% dplyr::select(-GEOID))
+
+  ## Response matrix
+  ymat <- t(as.matrix(df %>% dplyr::select(-GEOID)))
+
+  ## Fourier basis
+  basis <- create.fourier.basis(range(t), nbasis = num_basis)
+
+  ## ---- GCV for lambda ----
+  gcv_scores <- matrix(
+    0,
+    nrow = length(lambda_grid),
+    ncol = ncol(ymat)
+  )
+
+  for (i in seq_along(lambda_grid)) {
+    fdParObj <- fdPar(basis, int2Lfd(2), lambda = lambda_grid[i])
+    smooth_i <- smooth.basis(t, ymat, fdParObj)
+    gcv_scores[i, ] <- smooth_i$gcv
+  }
+
+  best_lambda <- lambda_grid[
+    which(gcv_scores == min(gcv_scores), arr.ind = TRUE)[1]
+  ]
+
+  ## ---- Final smoothing ----
+  best_fdPar <- fdPar(basis, int2Lfd(2), lambda = best_lambda)
+  smooth_best <- smooth.basis(t, ymat, best_fdPar)
+
+  fdobj <- smooth_best$fd
+
+  ## Smoothed dataframe
+  smooth_mat <- eval.fd(t, fdobj)
+
+  smooth_df <- as_tibble(t(smooth_mat)) %>%
+    tibble::add_column(GEOID = df$GEOID, .before = 1)
+
+  colnames(smooth_df) <- colnames(df)
+
+  ## ---- Sample curves + plot ----
+  plot_obj <- NULL
+
+  if (plot_samples) {
+
+    smooth_sample <- smooth_df %>%
+      mutate(
+        state_fips = substr(GEOID, 1, 2),
+        state      = state_fips_map[state_fips]
+      ) %>%
+      group_by(state) %>%
+      slice_sample(n = 1) %>%
+      ungroup() %>%
+      pivot_longer(
+        cols = starts_with("20"),
+        names_to = "day",
+        values_to = "value"
+      ) %>%
+      mutate(
+        value = as.numeric(value),
+        day   = as.Date(day)
+      )
+
+    plot_obj <- ggplot(
+      smooth_sample,
+      aes(x = day, y = value, group = state, col = state)
+    ) +
+      geom_line(linewidth = 0.8, alpha = 0.6) +
+      labs(
+        title = title,
+        x = "Date",
+        y = "Value",
+        color = "State"
+      ) +
+      scale_color_viridis_d() +
+      scale_x_date(
+        date_breaks = "2 weeks",
+        date_labels = "%b %d, %Y",
+        expand = expansion(mult = c(0.01, 0.05))
+      ) +
+      theme_bw(base_size = 10) +
+      theme(
+        panel.grid  = element_blank(),
+        axis.title  = element_text(size = 10),
+        axis.text   = element_text(size = 8),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 9),
+        plot.title  = element_text(size = 12, hjust = 0.5),
+        plot.margin = margin(t = 10, r = 10, b = 20, l = 10)
+      )
+  }
+
+  ## Return
+  list(
+    smooth_df   = smooth_df,
+    fd          = fdobj,
+    best_lambda = best_lambda,
+    plot        = plot_obj
+  )
+}
+
+
+# Wrapper Function
+smooth_fourier_list <- function(
+  data_list,
+  out_dir = "winter_smoothing",
+  num_basis = 101,
+  lambda_grid = 10^seq(-6, 6, length = 20),
+  save_plots = TRUE
+) {
+
+  ensure_dir(out_dir)
+
+  purrr::imap(data_list, function(var_list, var_name) {
+
+    var_dir <- file.path(out_dir, var_name)
+    ensure_dir(var_dir)
+
+    purrr::imap(var_list, function(df, season_name) {
+
+      season_dir <- file.path(var_dir, season_name)
+      ensure_dir(season_dir)
+
+      year <- gsub("winter", "", season_name)
+
+      title <- paste0(
+        var_name_map[[var_name]],
+        " – Winter ",
+        year
+      )
+
+      res <- smooth_fourier_df(
+        df            = df,
+        num_basis     = num_basis,
+        lambda_grid   = lambda_grid,
+        plot_samples  = TRUE,
+        title         = title
+      )
+
+      ## Save smoothed dataframe
+      readr::write_csv(
+        res$smooth_df,
+        file.path(season_dir, "smooth_df.csv")
+      )
+
+      ## Save lambda
+      readr::write_lines(
+        as.character(res$best_lambda),
+        file.path(season_dir, "best_lambda.txt")
+      )
+
+      ## Save fd object
+      saveRDS(
+        res$fd,
+        file.path(season_dir, "fd_object.rds")
+      )
+
+      ## Save plot
+      if (save_plots && !is.null(res$plot)) {
+        ggplot2::ggsave(
+          filename = file.path(season_dir, "sample_plot.png"),
+          plot     = res$plot,
+          width    = 8,
+          height   = 4,
+          dpi      = 300
+        )
+      }
+
+      res
+    })
+  })
+}
+```
+
+
+```{r}
+results_winter <- smooth_fourier_list(data_list_winter)
+```
+
+
+# FPCA
+
+```{r}
+run_fpca <- function(fd_obj, nharm = 3) {
+  pca.fd(fd_obj, nharm = nharm, centerfns = TRUE)
+}
+
+fpca_results <- purrr::imap(results_winter, function(var_list, var_name) {
+  purrr::imap(var_list, function(res, season_name) {
+    run_fpca(res$fd, nharm = 4)
+  })
+})
+```
+
+
+```{r}
+plot_fpca_scree <- function(fpca_obj, var_name, season_name) {
+
+  scree_df <- tibble(
+    PC = factor(seq_along(fpca_obj$varprop)),
+    Variance = fpca_obj$varprop
+  )
+
+  year <- gsub("winter", "", season_name)
+  
+  ggplot(scree_df, aes(PC, Variance)) +
+    geom_col(fill = "steelblue", alpha = 0.8) +
+    geom_point(size = 2) +
+    geom_line(aes(group = 1)) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    theme_bw() +
+    labs(
+      title = "FPCA Scree Plot",
+      subtitle = paste0(
+        var_name_map[[var_name]],
+        " – Winter ",
+        year),
+      x = "Principal Component",
+      y = "Variance Explained"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(
+      panel.grid  = element_blank(),
+      axis.title  = element_text(size = 10),
+      axis.text   = element_text(size = 8),,
+      legend.text = element_text(size = 8),
+      legend.title = element_text(size = 9)
+    )
+}
+
+
+plot_fpca_harmonics <- function(
+  fpca_obj,
+  var_name,
+  season_name,
+  n_grid = 183
+) {
+
+  ## Time grid
+  rng <- fpca_obj$harmonics$basis$rangeval
+  t_grid <- seq(rng[1], rng[2], length.out = n_grid)
+
+  ## Evaluate harmonics
+  harm_mat <- eval.fd(t_grid, fpca_obj$harmonics)
+
+  harm_df <- as_tibble(harm_mat) %>%
+    mutate(t = t_grid) %>%
+    pivot_longer(
+      cols = -t,
+      names_to = "PC",
+      values_to = "value"
+    )
+
+  year <- gsub("winter", "", season_name)
+  
+  ggplot(harm_df, aes(t, value)) +
+    geom_line(linewidth = 0.9) +
+    facet_wrap(~ PC, scales = "free_y") +
+    theme_bw() +
+    labs(
+      title = "FPCA Harmonics", 
+      subtitle =paste0(
+        var_name_map[[var_name]],
+        " – Winter ",
+        year),
+      x = "Time",
+      y = "Eigenfunction Value"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(
+      panel.grid  = element_blank(),
+      axis.title  = element_text(size = 10),
+      axis.text   = element_text(size = 8),
+      legend.text = element_text(size = 8),
+      legend.title = element_text(size = 9)
+    )
+}
+
+
+save_fpca_plots <- function(
+  fpca_results,
+  out_dir = "winter_smoothing"
+) {
+
+  purrr::imap(fpca_results, function(var_list, var_name) {
+
+    purrr::imap(var_list, function(fpca_obj, season_name) {
+
+      season_dir <- file.path(out_dir, var_name, season_name)
+
+      ## Create plots
+      scree_plot <- plot_fpca_scree(
+        fpca_obj,
+        var_name,
+        season_name
+      )
+
+      harmonic_plot <- plot_fpca_harmonics(
+        fpca_obj,
+        var_name,
+        season_name
+      )
+
+      ## Save plots
+      ggsave(
+        filename = file.path(season_dir, "fpca_scree.png"),
+        plot     = scree_plot,
+        width    = 6,
+        height   = 4,
+        dpi      = 300
+      )
+
+      ggsave(
+        filename = file.path(season_dir, "fpca_harmonics.png"),
+        plot     = harmonic_plot,
+        width    = 8,
+        height   = 4,
+        dpi      = 300
+      )
+
+      invisible(NULL)
+    })
+  })
+}
+
+```
+
+
+```{r}
+save_fpca_plots(fpca_results)
+```
+
+
+# Functional Regression
+
+## Extract FPCA
+
+```{r}
+extract_fpca_scores_var <- function(
+  fpca_var,
+  results_var,
+  var_name,
+  K = 3
+) {
+
+  purrr::imap_dfr(fpca_var, function(fpca_obj, season_name) {
+
+    scores <- as_tibble(fpca_obj$scores[, 1:K, drop = FALSE])
+    colnames(scores) <- paste0(var_name, "_PC", 1:K)
+
+    tibble(
+      GEOID = results_var[[season_name]]$smooth_df$GEOID,
+      season = season_name
+    ) %>%
+      bind_cols(scores)
+
+  })
+}
+
+```
+
+
+```{r}
+fpca_prcp <- extract_fpca_scores_var(
+  fpca_results$prcp,
+  results_winter$prcp,
+  "prcp"
+)
+
+fpca_swe <- extract_fpca_scores_var(
+  fpca_results$swe,
+  results_winter$swe,
+  "swe"
+)
+
+fpca_tmin <- extract_fpca_scores_var(
+  fpca_results$tmin,
+  results_winter$tmin,
+  "tmin"
+)
+
+fpca_tmax <- extract_fpca_scores_var(
+  fpca_results$tmax,
+  results_winter$tmax,
+  "tmax"
+)
+
+```
+
+
+## Combine into Dataframe
+
+```{r}
+tracts_sf = tracts_sf[order(tracts_sf$GEOID), ]
+tracts_sf$area_id <- seq_len(nrow(tracts_sf))
+id_map <- tracts_sf[, c("GEOID","area_id")] |> st_drop_geometry()
+
+
+regression_df <- fpca_prcp %>%
+  left_join(fpca_swe,  by = c("GEOID", "season")) %>%
+  left_join(fpca_tmin, by = c("GEOID", "season")) %>%
+  left_join(fpca_tmax, by = c("GEOID", "season")) %>%
+  left_join(data_list$index, by = "GEOID", multiple = "all")
+
+regression_df <- left_join(regression_df, id_map, by = "GEOID")
+
+regression_df = drop_na(regression_df)
+
+regression_df <- regression_df %>%
+  mutate(
+    year = as.integer(stringr::str_extract(season, "\\d{4}")),
+    across(ends_with("PC"), ~ as.numeric(scale(.x))),
+    risk_index = percent_rank(risk_index),
+    risk_index_manual = percent_rank(risk_index_manual),
+    st_id = interaction(GEOID, year)
+    ) %>%
+  arrange(GEOID, year)
+```
+
+
+## Create Lag Columns
+
+```{r}
+pc_cols <- names(regression_df)[stringr::str_detect(names(regression_df), "_PC\\d+$")]
+
+regression_df_lag <- regression_df %>%
+  group_by(GEOID) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(
+    across(all_of(pc_cols), ~ dplyr::lag(.x, 1), .names = "{.col}_lag1")
+  ) %>%
+  ungroup() %>%
+  mutate(year = as.factor(year))
+
+regression_df_lag = drop_na(regression_df_lag)
+```
+
+
+```{r}
+model_form = as.formula(paste(
+  "risk_index ~",
+  paste0("s(", pc_cols, ", k = 10, bs='ps')", collapse = " + "), " + ",
+  " + s(year, bs='re')"
+))
+lag_model_form <- as.formula(paste(
+  "risk_index ~",
+  paste0("s(", pc_cols, ", k = 10, bs='ps')", collapse = " + "), " + ",
+  paste0("s(", paste0(pc_cols, "_lag1"), ", k = 10, bs='ps')", collapse = " + "), " + ",
+  " + s(year, bs='re')"
+))
+model_form.m = as.formula(paste(
+  "risk_index_manual ~",
+  paste0("s(", pc_cols, ", k = 10, bs='ps')", collapse = " + "), " + ",
+  " + s(year, bs='re')"
+))
+lag_model_form.m <- as.formula(paste(
+  "risk_index_manual ~",
+  paste0("s(", pc_cols, ", k = 10, bs='ps')", collapse = " + "), " + ",
+  paste0("s(", paste0(pc_cols, "_lag1"), ", k = 10, bs='ps')", collapse = " + "), " + ",
+  " + s(year, bs='re')"
+))
+
+gam_fit = bam(model_form, data = regression_df, method = "fREML", discrete =T, nthreads = 20)
+gam_lag_fit <- bam(lag_model_form, data = regression_df_lag, method = "fREML", discrete =T, nthreads = 20)
+gam_fit.m = bam(model_form.m, data = regression_df, method = "fREML", discrete =T, nthreads = 20)
+gam_lag_fit.m <- bam(lag_model_form.m, data = regression_df_lag, method = "fREML", discrete =T, nthreads = 20)
+```
+
+
+```{r}
+summary(gam_fit)
+gam.check(gam_fit)
+concurvity(gam_fit)
+plot(gam_fit)
+```
+
+```{r}
+summary(gam_lag_fit)
+gam.check(gam_lag_fit)
+concurvity(gam_lag_fit)
+plot(gam_lag_fit)
+```
+
+```{r}
+summary(gam_fit.m)
+gam.check(gam_fit.m)
+concurvity(gam_fit.m)
+plot(gam_fit.m)
+```
+
+```{r}
+summary(gam_lag_fit.m)
+gam.check(gam_lag_fit.m)
+concurvity(gam_lag_fit.m)
+plot(gam_lag_fit.m)
+```
+
+```{r}
+output_fit_stats <- function(fit, directory) {
+  fit_tidy = broom::tidy(fit)
+  
+  tidy_kable <- kable(
+    fit_tidy,
+    format = "latex",
+    booktabs = TRUE
+  )
+  
+  writeLines(tidy_kable, paste0("./results/", directory,"/estimates.tex"))
+  
+  
+  fit_glance = broom::glance(fit)
+  
+  glance_kable <- kable(
+    fit_glance,
+    format = "latex",
+    booktabs = TRUE
+  )
+  
+  writeLines(glance_kable, paste0("./results/", directory,"/metrics.tex"))
+}
+``` 
+
+
+```{r}
+output_fit_stats(gam_fit, "gam_fit")
+output_fit_stats(gam_lag_fit, "gam_lag_fit")
+output_fit_stats(gam_fit.m, "gam_fit_m")
+output_fit_stats(gam_lag_fit.m, "gam_lag_fit_m")
+```
+
+## Copula Layer
+
+```{r}
+
+tracts_sf <- tracts_sf[match(levels(factor(regression_df_lag$GEOID)), tracts_sf$GEOID), ]
+stopifnot(all(tracts_sf$GEOID == levels(factor(regression_df_lag$GEOID))))
+
+nb <- poly2nb(tracts_sf, queen = TRUE)  # queen adjacency is common
+W  <- nb2mat(nb, style = "B", zero.policy = TRUE)
+
+# Write/read INLA graph
+graph_file <- tempfile(fileext = ".adj")
+INLA::inla.write.graph(W, file = graph_file)
+g <- INLA::inla.read.graph(graph_file)
+```
+
+
+
+
+```{r}
+## Copula
+regression_df$gam_resid = gam_fit$residuals
+
+regression_df$year = as.numeric(as.character(regression_df$year))
+
+
+cop_fit <- inla(
+  gam_resid ~ 1 +
+    f(area_id, model="bym2", graph=g, scale.model=TRUE) +
+    f(year, model="rw1") +
+    f(st_id, model="iid"),
+  data = regression_df,
+  family="gaussian",
+  control.predictor=list(compute=T, link = 1),
+  control.compute=list(waic=TRUE, dic=TRUE, cpo=T, config=T)
+)
+
+## Lag Copula
+regression_df_lag$gam_lag_resid = gam_lag_fit$residuals
+
+regression_df_lag$year = as.numeric(as.character(regression_df_lag$year))
+
+
+cop_lag_fit <- inla(
+  gam_lag_resid ~ 1 +
+    f(area_id, model="bym2", graph=g, scale.model=TRUE) +
+    f(year, model="rw1") +
+    f(st_id, model="iid"),
+  data = regression_df_lag,
+  family="gaussian",
+  control.predictor=list(compute=T, link = 1),
+  control.compute=list(waic=TRUE, dic=TRUE, cpo=T, config=T)
+)
+```
+
+
+```{r}
+## Copula
+regression_df$gam_resid.m = gam_fit.m$residuals
+
+cop_fit.m <- inla(
+  gam_resid.m ~ 1 +
+    f(area_id, model="bym2", graph=g, scale.model=TRUE) +
+    f(year, model="rw1") +
+    f(st_id, model="iid"),
+  data = regression_df,
+  family="gaussian",
+  control.predictor=list(compute=T, link = 1),
+  control.compute=list(waic=TRUE, dic=TRUE, cpo=T, config=T)
+)
+
+## Lag Copula
+regression_df_lag$gam_lag_resid.m = gam_lag_fit.m$residuals
+
+cop_lag_fit.m <- inla(
+  gam_lag_resid.m ~ 1 +
+    f(area_id, model="bym2", graph=g, scale.model=TRUE) +
+    f(year, model="rw1") +
+    f(st_id, model="iid"),
+  data = regression_df_lag,
+  family="gaussian",
+  control.predictor=list(compute=T, link = 1),
+  control.compute=list(waic=TRUE, dic=TRUE, cpo=T, config=T)
+)
+```
+
+
+
+
+```{r}
+copula_diagnostics_plots <- function(dataset,
+                                    cop_fit,
+                                    plot_subdir,
+                                    # optional (used if you want Moran's I plots)
+                                    inla_graph = NULL,
+                                    area_id_col = "area_id",
+                                    year_col    = "year",
+                                    resid_col   = "gam_lag_resid",
+                                    # posterior predictive check controls
+                                    S = 300,
+                                    seed = 1,
+                                    # ggsave controls
+                                    width = 6, height = 4, dpi = 300) {
+  # ---- package checks ----
+  pkgs <- c("dplyr", "ggplot2", "purrr", "tibble")
+  miss <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(miss)) stop("Missing packages: ", paste(miss, collapse = ", "))
+
+  # ---- output directory ----
+  out_dir <- file.path(".", "plots", "copula", plot_subdir)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # ---- common theme ----
+  base_theme <- ggplot2::theme_bw(base_size = 10) +
+    ggplot2::theme(
+      panel.grid   = ggplot2::element_blank(),
+      axis.title   = ggplot2::element_text(size = 10),
+      axis.text    = ggplot2::element_text(size = 8),
+      legend.text  = ggplot2::element_text(size = 8),
+      legend.title = ggplot2::element_text(size = 9)
+    )
+
+  # ---- build diagnostics df ----
+  n <- nrow(dataset)
+
+  cpo <- cop_fit$cpo$cpo
+  pit <- cop_fit$cpo$pit
+  if (length(cpo) != n) cpo <- rep_len(cpo, n)
+  if (length(pit) != n) pit <- rep_len(pit, n)
+
+  diag_df <- dplyr::as_tibble(dataset) %>%
+    dplyr::mutate(
+      cpo  = cpo,
+      lcpo = log(pmax(cpo, .Machine$double.eps)),
+      pit  = pit
+    )
+
+  thr <- stats::quantile(diag_df$lcpo, 0.01, na.rm = TRUE)
+  diag_df <- diag_df %>% dplyr::mutate(outlier_cpo = lcpo <= thr)
+
+  # ---- plots list + helper saver ----
+  plots <- list()
+  plot_paths <- character(0)
+
+  save_plot <- function(p, fname) {
+    fp <- file.path(out_dir, fname)
+    ggplot2::ggsave(filename = fp, plot = p, width = width, height = height, dpi = dpi)
+    plot_paths <<- c(plot_paths, fp)
+    invisible(fp)
+  }
+
+  # 1) log(CPO) histogram
+  plots$cpo_hist <- ggplot2::ggplot(diag_df, ggplot2::aes(x = lcpo)) +
+    ggplot2::geom_histogram(bins = 50) +
+    ggplot2::labs(x = "log(CPO)", y = "Count", title = "INLA CPO diagnostic") +
+    base_theme
+  save_plot(plots$cpo_hist, "01_cpo_log_hist.png")
+
+  # 2) PIT histogram
+  plots$pit_hist <- ggplot2::ggplot(diag_df, ggplot2::aes(x = pit)) +
+    ggplot2::geom_histogram(bins = 30) +
+    ggplot2::labs(x = "PIT", y = "Count", title = "PIT histogram (calibration check)") +
+    base_theme
+  save_plot(plots$pit_hist, "02_pit_hist.png")
+
+  # ---- fitted mean/sd + residuals ----
+  mu_mean <- cop_fit$summary.fitted.values$mean
+  mu_sd   <- cop_fit$summary.fitted.values$sd
+  if (length(mu_mean) != n) mu_mean <- rep_len(mu_mean, n)
+  if (length(mu_sd)   != n) mu_sd   <- rep_len(mu_sd, n)
+
+  if (is.null(diag_df[[resid_col]])) {
+    stop("`dataset` must contain a residual column named '", resid_col, "' (or set resid_col=...).")
+  }
+
+  diag_df <- diag_df %>%
+    dplyr::mutate(
+      mu    = mu_mean,
+      resid = .data[[resid_col]] - mu,
+      z_fit = resid / pmax(mu_sd, 1e-12)
+    )
+
+  # 3) Residuals vs fitted mean
+  plots$resid_vs_mu <- ggplot2::ggplot(diag_df, ggplot2::aes(mu, resid)) +
+    ggplot2::geom_point(alpha = 0.6) +
+    ggplot2::geom_hline(yintercept = 0) +
+    ggplot2::labs(x = "Fitted Mean", y = "Residual", title = "Residuals vs Fitted Mean") +
+    base_theme
+  save_plot(plots$resid_vs_mu, "03_resid_vs_fitted_mean.png")
+
+  # 4) z_fit histogram
+  plots$zfit_hist <- ggplot2::ggplot(diag_df, ggplot2::aes(z_fit)) +
+    ggplot2::geom_histogram(bins = 40) +
+    ggplot2::labs(x = "Standardized residual", y = "Count", title = "Standardized residuals vs fitted uncertainty") +
+    base_theme
+  save_plot(plots$zfit_hist, "04_zfit_hist.png")
+
+  # ---- observation sigma from hyperparameters ----
+  hyp <- cop_fit$summary.hyperpar
+  obs_row <- grep("Precision.*Gaussian", rownames(hyp), ignore.case = TRUE)
+  if (length(obs_row) < 1) {
+    warning("Could not find 'Precision.*Gaussian' row in summary.hyperpar; skipping sigma-based plots and PPC.")
+    sigma_mean <- NA_real_
+  } else {
+    prec_mean  <- hyp[obs_row[1], "mean"]
+    sigma_mean <- 1 / sqrt(prec_mean)
+  }
+
+  if (is.finite(sigma_mean)) {
+    diag_df <- diag_df %>% dplyr::mutate(z_obs = resid / sigma_mean)
+
+    # 5) z_obs histogram
+    plots$zobs_hist <- ggplot2::ggplot(diag_df, ggplot2::aes(z_obs)) +
+      ggplot2::geom_histogram(bins = 40) +
+      ggplot2::labs(x = "Residual / Sigma", y = "Count", title = "Standardized Residuals") +
+      base_theme
+    save_plot(plots$zobs_hist, "05_zobs_hist.png")
+  }
+
+  # ---- posterior predictive checks ----
+  ppc <- NULL
+  if (is.finite(sigma_mean) &&
+      requireNamespace("INLA", quietly = TRUE)) {
+    set.seed(seed)
+    samps <- INLA::inla.posterior.sample(S, cop_fit)
+
+    eta_draws <- INLA::inla.posterior.sample.eval(function(...) Predictor, samps) # N x S
+    sigma <- sigma_mean
+
+    yrep <- apply(eta_draws, 2, function(mu) stats::rnorm(length(mu), mean = mu, sd = sigma))
+
+    obs_mean <- mean(diag_df[[resid_col]], na.rm = TRUE)
+    obs_sd   <- stats::sd(diag_df[[resid_col]], na.rm = TRUE)
+
+    ppc <- data.frame(
+      mean_rep = colMeans(yrep),
+      sd_rep   = apply(yrep, 2, stats::sd)
+    )
+
+    plots$ppc_mean <- ggplot2::ggplot(ppc, ggplot2::aes(mean_rep)) +
+      ggplot2::geom_histogram(bins = 30) +
+      ggplot2::geom_vline(xintercept = obs_mean) +
+      ggplot2::labs(title = "PPC: Replicated Means", x = "Mean", y = "Count") +
+      base_theme
+    save_plot(plots$ppc_mean, "06_ppc_means.png")
+
+    plots$ppc_sd <- ggplot2::ggplot(ppc, ggplot2::aes(sd_rep)) +
+      ggplot2::geom_histogram(bins = 30) +
+      ggplot2::geom_vline(xintercept = obs_sd) +
+      ggplot2::labs(title = "PPC: Replicated SDs", x = "Standard Deviation", y = "Count") +
+      base_theme
+    save_plot(plots$ppc_sd, "07_ppc_sds.png")
+  } else if (!requireNamespace("INLA", quietly = TRUE)) {
+    warning("Package 'INLA' not available; skipping posterior predictive checks.")
+  }
+
+  # ---- Moran's I by year (optional) ----
+  moran_by_year <- NULL
+  if (!is.null(inla_graph)) {
+    if (!requireNamespace("spdep", quietly = TRUE)) {
+      warning("Package 'spdep' not available; skipping Moran's I plots.")
+    } else if (!is.finite(sigma_mean)) {
+      warning("sigma_mean not available; skipping Moran's I plots.")
+    } else {
+      A <- INLA::inla.graph2matrix(inla_graph)
+      A <- as.matrix(A)
+      diag(A) <- 0
+
+      graph_ids <- rownames(A)
+      if (is.null(graph_ids)) {
+        graph_ids <- seq_len(nrow(A))
+      } else {
+        # best-effort: try numeric ids if possible
+        suppressWarnings({
+          gi_num <- as.integer(graph_ids)
+          if (!all(is.na(gi_num))) graph_ids <- gi_num
+        })
+      }
+
+      lw <- spdep::mat2listw(A, style = "W", zero.policy = TRUE)
+
+      dat <- dplyr::as_tibble(dataset) %>%
+        dplyr::mutate(
+          mu    = mu_mean,
+          resid = .data[[resid_col]] - mu,
+          z     = resid / sigma_mean
+        )
+
+      z_area_year <- dat %>%
+        dplyr::group_by(.data[[year_col]], .data[[area_id_col]]) %>%
+        dplyr::summarise(z_ay = mean(z, na.rm = TRUE), .groups = "drop")
+
+      years <- sort(unique(z_area_year[[year_col]]))
+
+      moran_by_year <- purrr::map_dfr(years, function(yy) {
+        tmp <- dplyr::filter(z_area_year, .data[[year_col]] == yy)
+
+        # align to graph ids
+        zyy <- tmp$z_ay[match(graph_ids, tmp[[area_id_col]])]
+        zyy[is.na(zyy)] <- 0
+
+        mt <- spdep::moran.test(zyy, lw, zero.policy = TRUE)
+        tibble::tibble(
+          year = yy,
+          I    = unname(mt$estimate[["Moran I statistic"]]),
+          p    = mt$p.value
+        )
+      })
+
+      plots$moran_I <- ggplot2::ggplot(moran_by_year, ggplot2::aes(x = year, y = I)) +
+        ggplot2::geom_line() +
+        ggplot2::geom_point() +
+        ggplot2::labs(title = "Moran's I of Standardized Residuals By Year",
+                      y = "Moran's I", x = "Year") +
+        base_theme
+      save_plot(plots$moran_I, "08_moran_I_by_year.png")
+
+      plots$moran_p <- ggplot2::ggplot(moran_by_year, ggplot2::aes(x = year, y = -log10(p))) +
+        ggplot2::geom_line() +
+        ggplot2::geom_point() +
+        ggplot2::geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+        ggplot2::labs(title = "Spatial Autocorrelation Significance By Year",
+                      y = "-log10(p-value)", x = "Year") +
+        base_theme
+      save_plot(plots$moran_p, "09_moran_p_by_year.png")
+    }
+  }
+
+  invisible(list(
+    out_dir        = out_dir,
+    plot_paths     = plot_paths,
+    diag_df        = diag_df,
+    thr_lcpo_01    = thr,
+    sigma_mean     = sigma_mean,
+    ppc           = ppc,
+    moran_by_year  = moran_by_year,
+    plots          = plots
+  ))
+}
+```
+
+
+```{r}
+out_1 <- copula_diagnostics_plots(
+  dataset     = regression_df,
+  cop_fit     = cop_fit,
+  plot_subdir = "model",
+  resid_col   = "gam_resid",
+  inla_graph  = g          
+)
+out_1$out_dir
+out_1$plot_paths
+
+
+out_2 <- copula_diagnostics_plots(
+  dataset     = regression_df_lag,
+  cop_fit     = cop_lag_fit,
+  plot_subdir = "model_lag",
+  resid_col   = "gam_lag_resid",
+  inla_graph  = g          
+)
+out_2$out_dir
+out_2$plot_paths
+
+
+out_3 <- copula_diagnostics_plots(
+  dataset     = regression_df,
+  cop_fit     = cop_fit.m,
+  plot_subdir = "model_m",
+  resid_col   = "gam_resid.m",
+  inla_graph  = g          
+)
+out_3$out_dir
+out_3$plot_paths
+
+
+out_4 <- copula_diagnostics_plots(
+  dataset     = regression_df_lag,
+  cop_fit     = cop_lag_fit.m,
+  plot_subdir = "model_lag_m",
+  resid_col   = "gam_lag_resid.m",
+  inla_graph  = g          
+)
+out_4$out_dir
+out_4$plot_paths
+
+
+```
+
+

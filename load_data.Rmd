@@ -640,6 +640,5 @@ lnd_geo = left_join(tracts_sf, lnd_prop, by = "GEOID")
 lnd_geo = st_as_sf(lnd_geo)
 ggplot(lnd_geo) + 
   geom_sf(aes(fill = `Shrub/Scrub`), col = NA)
-
 ```
 
